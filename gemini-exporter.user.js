@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Chat Exporter (PDF & Markdown)
 // @namespace    https://github.com/yrambler2001/gemini-chat-exporter
-// @version      1.0.0
+// @version      2.0.0
 // @description  Scrapes Gemini chat, intercepts native copy buttons for perfect Markdown, and exports a code-wrapped PDF. Bypasses virtual DOM limits.
 // @author       yrambler2001
 // @match        https://gemini.google.com/*
@@ -132,13 +132,15 @@
     });
   }
 
-  /**
-   * Removes unnecessary UI clutter from a cloned DOM node so the PDF looks clean.
-   * * @param {Element} node - The cloned DOM element to sanitize.
-   * @returns {Element} The sanitized DOM element.
-   */
-  function cleanCloneForPDF(node) {
-    const clone = node.cloneNode(true);
+  // Surgically extracts only the inner content to prevent CSS grid overlap in PDFs
+  function extractCleanHTML(container, isUser) {
+    const targetSelector = isUser ? '.query-text' : '.markdown';
+    const targetEl = container.querySelector(targetSelector);
+
+    if (!targetEl) return null;
+
+    const clone = targetEl.cloneNode(true);
+
     const selectorsToRemove = [
       'button',
       'mat-icon',
@@ -149,8 +151,10 @@
       'tooltip',
       '.cdk-visually-hidden',
       '[aria-hidden="true"]',
+      '.code-block-decoration',
     ];
     clone.querySelectorAll(selectorsToRemove.join(', ')).forEach((el) => el.remove());
+
     return clone;
   }
 
@@ -221,20 +225,40 @@
     exportBtn.textContent = '⏳ Scraping Virtual DOM...';
 
     while (!reachedBottom) {
-      const messages = document.querySelectorAll('user-query, model-response, dual-model-response, generative-ui-response');
+      const containers = document.querySelectorAll('.conversation-container');
 
-      for (const msg of messages) {
-        const key = msg.outerHTML;
+      for (const container of containers) {
+        const key = container.id || container.innerHTML.length.toString();
 
-        // Only process nodes we haven't seen yet
         if (!collectedData.has(key)) {
-          // Extract Native Markdown while the element is active in the live DOM
-          const mdText = await extractNativeMarkdown(msg);
+          const userQuery = container.querySelector('user-query');
+          const modelResp = container.querySelector('model-response, dual-model-response, generative-ui-response');
 
-          collectedData.set(key, {
-            pdfNode: cleanCloneForPDF(msg),
-            markdown: mdText,
-          });
+          let userHtml = null,
+            aiHtml = null;
+          let userMd = '',
+            aiMd = '';
+
+          if (userQuery) {
+            userHtml = extractCleanHTML(userQuery, true);
+            if (userHtml) userMd = `## You\n\n${userHtml.textContent.trim()}\n\n---\n\n`;
+          }
+
+          if (modelResp) {
+            aiHtml = extractCleanHTML(modelResp, false);
+            const nativeMd = await extractNativeMarkdown(modelResp);
+            if (nativeMd && nativeMd !== 'failed to obtain data') {
+              aiMd = `## Gemini\n\n${nativeMd}\n\n---\n\n`;
+            }
+          }
+
+          if (userHtml || aiHtml) {
+            collectedData.set(key, {
+              userHtml,
+              aiHtml,
+              markdown: userMd + aiMd,
+            });
+          }
         }
       }
 
@@ -254,13 +278,8 @@
     // --- 3C. COMPILE & DOWNLOAD MARKDOWN ---
     let markdownText = `# ${chatTitle}\n**Exported:** ${dateStr}\n\n---\n\n`;
 
-    collectedData.forEach((data, key) => {
-      // Keys starting with <user-query identify human prompts
-      if (key.startsWith('<user-query')) {
-        markdownText += `## You\n\n${data.markdown}\n\n---\n\n`;
-      } else {
-        markdownText += `## Gemini\n\n${data.markdown}\n\n---\n\n`;
-      }
+    collectedData.forEach((data) => {
+      markdownText += data.markdown;
     });
 
     // Clean up excessive newlines, then trigger download
@@ -269,6 +288,7 @@
 
     // --- 3D. RECONSTRUCT DOM FOR PDF PRINTING ---
     const printContainer = document.createElement('div');
+    printContainer.id = 'gemini-print-container';
     printContainer.style.margin = '0 auto';
     printContainer.style.maxWidth = '830px';
     printContainer.style.padding = '20px';
@@ -292,9 +312,27 @@
     pdfHeader.appendChild(pdfDate);
     printContainer.appendChild(pdfHeader);
 
-    // Append all saved and cleaned DOM nodes
+    // Append cleanly extracted content nodes with explicit labels to avoid CSS Grid overlaps
     collectedData.forEach((data) => {
-      printContainer.appendChild(data.pdfNode);
+      if (data.userHtml) {
+        const userWrapper = document.createElement('div');
+        userWrapper.className = 'pdf-message-wrapper user-message';
+        const label = document.createElement('strong');
+        label.textContent = 'You:';
+        userWrapper.appendChild(label);
+        userWrapper.appendChild(data.userHtml);
+        printContainer.appendChild(userWrapper);
+      }
+
+      if (data.aiHtml) {
+        const aiWrapper = document.createElement('div');
+        aiWrapper.className = 'pdf-message-wrapper ai-message';
+        const label = document.createElement('strong');
+        label.textContent = 'Gemini:';
+        aiWrapper.appendChild(label);
+        aiWrapper.appendChild(data.aiHtml);
+        printContainer.appendChild(aiWrapper);
+      }
     });
 
     // Hide original Gemini UI (better than innerHTML='' as it preserves <style> tags)
@@ -303,7 +341,7 @@
     });
 
     document.body.appendChild(printContainer);
-    document.body.style.background = 'var(--gem-sys-color--surface)';
+    document.body.style.background = '#ffffff';
     document.body.style.overflow = 'visible';
 
     // Inject specific Print CSS
@@ -313,13 +351,43 @@
             /* Defeat Gemini's lazy rendering hiding rules */
             * { content-visibility: visible !important; }
             
-            /* Force code blocks to wrap to prevent right-margin cutoff in PDF */
-            pre, code, .code-block {
+            body { background: #ffffff !important; color: #1f1f1f !important; }
+
+            /* Clean block formatting to prevent overlaps */
+            .pdf-message-wrapper {
+                display: block !important;
+                margin-bottom: 30px !important;
+                padding-bottom: 20px !important;
+                border-bottom: 1px solid #e5e7eb;
+                page-break-inside: auto !important;
+                font-family: 'Google Sans', sans-serif;
+            }
+            
+            .pdf-message-wrapper strong {
+                display: block;
+                margin-bottom: 10px;
+                font-size: 1.1rem;
+            }
+            
+            .user-message strong { color: #0b57d0; }
+            .ai-message strong { color: #1f1f1f; }
+            
+            /* Allow code blocks to wrap text, and allow the blocks themselves to split across pages */
+            pre, code, .code-container {
                 white-space: pre-wrap !important;
                 word-break: break-word !important;
                 overflow-wrap: break-word !important;
                 overflow-x: hidden !important; 
                 max-width: 100% !important;
+                page-break-inside: auto !important; 
+            }
+            
+            pre {
+                background-color: #f8f9fa !important;
+                padding: 16px !important;
+                border-radius: 8px !important;
+                border: 1px solid #dadce0 !important;
+                margin: 16px 0 !important;
             }
             
             @media print {
@@ -327,7 +395,6 @@
                 body { 
                     -webkit-print-color-adjust: exact; 
                     print-color-adjust: exact; 
-                    background: var(--gem-sys-color--surface) !important; 
                 }
                 button { display: none !important; }
             }
